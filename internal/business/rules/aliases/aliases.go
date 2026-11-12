@@ -43,26 +43,15 @@ func init() {
 func NewMaxAliasesRule(cfg Config, rules *validatorrules.Rules) {
 	if cfg.Enabled {
 		rules.AddRule("MaxAliases", func(observers *validator.Events, addError validator.AddErrFunc) {
-			// keep track of # of aliases per fragment definition (memo cache, shared across operations)
-			visitedFragments := make(map[string]int)
-
-			// aliases is declared per-operation inside OnOperation so it doesn't accumulate across
-			// multiple operation definitions in the same document.
-			var operationFragmentAliases int
-
-			observers.OnFragmentSpread(func(_ *validator.Walker, fragmentSpread *ast.FragmentSpread) {
-				definition := fragmentSpread.Definition
-				if _, ok := visitedFragments[definition.Name]; !ok {
-					count := countSelectionSet(definition.SelectionSet)
-					visitedFragments[definition.Name] = count
-				}
-
-				operationFragmentAliases += visitedFragments[definition.Name]
-			})
-
 			observers.OnOperation(func(_ *validator.Walker, operation *ast.OperationDefinition) {
-				aliases := countAliases(operation) + operationFragmentAliases
-				operationFragmentAliases = 0 // reset for next operation
+				// Count everything reachable from this operation in a single pass.
+				// The fragment memo is scoped per operation so budgets never leak
+				// between operation definitions in the same document.
+				counter := &aliasCounter{
+					fragmentAliases: make(map[string]int),
+					activeFragments: make(map[string]bool),
+				}
+				aliases := counter.countSelectionSet(operation.SelectionSet)
 
 				maxAliases := cfg.Max
 				if override, ok := cfg.Overrides[operation.Name]; ok {
@@ -95,24 +84,54 @@ func NewMaxAliasesRule(cfg Config, rules *validatorrules.Rules) {
 	}
 }
 
-func countAliases(operation *ast.OperationDefinition) int {
-	return countSelectionSet(operation.SelectionSet)
+type aliasCounter struct {
+	// fragmentAliases memoizes the number of aliases reachable from a named
+	// fragment definition, keyed by fragment name.
+	fragmentAliases map[string]int
+	// activeFragments tracks fragments currently on the traversal stack to
+	// guard against cyclic or repeated fragment references.
+	activeFragments map[string]bool
 }
 
-func countSelectionSet(set ast.SelectionSet) int {
+func (c *aliasCounter) countSelectionSet(set ast.SelectionSet) int {
 	count := 0
-	if len(set) == 0 {
-		return count
-	}
 
 	for _, selection := range set {
-		if v, ok := selection.(*ast.Field); ok {
+		switch selection := selection.(type) {
+		case *ast.Field:
 			// When a query has no alias defined it defaults to the name of the query
-			if v.Alias != "" && v.Alias != v.Name {
+			if selection.Alias != "" && selection.Alias != selection.Name {
 				count++
 			}
 
-			count += countSelectionSet(v.SelectionSet)
+			count += c.countSelectionSet(selection.SelectionSet)
+		case *ast.InlineFragment:
+			count += c.countSelectionSet(selection.SelectionSet)
+		case *ast.FragmentSpread:
+			if selection.Definition == nil {
+				continue
+			}
+
+			name := selection.Definition.Name
+
+			if memoized, ok := c.fragmentAliases[name]; ok {
+				count += memoized
+				continue
+			}
+
+			// A fragment that is already being expanded references itself,
+			// directly or transitively. Stop expanding the cycle; GraphQL
+			// validation rejects such documents anyway.
+			if c.activeFragments[name] {
+				continue
+			}
+
+			c.activeFragments[name] = true
+			fragmentCount := c.countSelectionSet(selection.Definition.SelectionSet)
+			delete(c.activeFragments, name)
+
+			c.fragmentAliases[name] = fragmentCount
+			count += fragmentCount
 		}
 	}
 

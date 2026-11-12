@@ -11,6 +11,7 @@ import (
 	"github.com/vektah/gqlparser/v2/validator"
 	validatorrules "github.com/vektah/gqlparser/v2/validator/rules"
 	"testing"
+	"time"
 )
 
 func Test_MaxAliasesRule(t *testing.T) {
@@ -199,6 +200,85 @@ type Book {
 				Message:       fmt.Sprintf("aliases limit of %d exceeded, found %d", 1, 2),
 			}.AsGqlError(),
 		},
+		{
+			name: "counts aliases hidden inside inline fragments",
+			args: args{
+				query: `query A {
+		 getBook(title: "null") {
+		   ... on Book {
+		     firstTitle: title
+		     secondTitle: title
+		   }
+		 }
+		}`,
+				schema: schema,
+				cfg: Config{
+					Max:             1,
+					Enabled:         true,
+					RejectOnFailure: true,
+				},
+			},
+			want: validation.RuleValidationResult{
+				Rule:          "max-aliases",
+				OperationName: "",
+				Result:        validation.REJECTED,
+				Message:       fmt.Sprintf("aliases limit of %d exceeded, found %d", 1, 2),
+			}.AsGqlError(),
+		},
+		{
+			name: "counts aliases in inline fragments nested inside named fragments",
+			args: args{
+				query: `query A {
+		 getBook(title: "null") {
+		   ...BookFragment
+		 }
+		}
+		fragment BookFragment on Book {
+		 ... on Book {
+		   firstTitle: title
+		   secondTitle: title
+		 }
+		}`,
+				schema: schema,
+				cfg: Config{
+					Max:             1,
+					Enabled:         true,
+					RejectOnFailure: true,
+				},
+			},
+			want: validation.RuleValidationResult{
+				Rule:          "max-aliases",
+				OperationName: "",
+				Result:        validation.REJECTED,
+				Message:       fmt.Sprintf("aliases limit of %d exceeded, found %d", 1, 2),
+			}.AsGqlError(),
+		},
+		{
+			name: "repeated fragment references are counted per reference",
+			args: args{
+				query: `query A {
+		 getBook(title: "null") {
+		   ...BookFragment
+		   ...BookFragment
+		 }
+		}
+		fragment BookFragment on Book {
+		 firstTitle: title
+		}`,
+				schema: schema,
+				cfg: Config{
+					Max:             1,
+					Enabled:         true,
+					RejectOnFailure: true,
+				},
+			},
+			want: validation.RuleValidationResult{
+				Rule:          "max-aliases",
+				OperationName: "",
+				Result:        validation.REJECTED,
+				Message:       fmt.Sprintf("aliases limit of %d exceeded, found %d", 1, 2),
+			}.AsGqlError(),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -277,4 +357,101 @@ query OpB {
 	errs := validator.ValidateWithRules(schema, parsedQuery, rules)
 
 	assert.Empty(t, errs, "each operation has 6 aliases which is below the limit of 10; both should be allowed")
+}
+
+// Test_MaxAliasesRule_InlineFragmentPerOperation verifies aliases hidden in
+// inline fragments are counted, and that the count stays scoped per operation.
+func Test_MaxAliasesRule_InlineFragmentPerOperation(t *testing.T) {
+	schemaStr := `
+type Query {
+   getBook(title: String): Book
+}
+
+type Book {
+	id: ID!
+	title: String
+	author: String
+}`
+
+	// Each operation hides 2 aliases inside an inline fragment; limit is 3.
+	query := `
+query OpA {
+    getBook(title: "1") {
+        ... on Book {
+            a1: title
+            a2: title
+        }
+    }
+}
+query OpB {
+    getBook(title: "2") {
+        ... on Book {
+            b1: title
+            b2: title
+        }
+    }
+}`
+
+	cfg := Config{
+		Enabled:         true,
+		Max:             3,
+		RejectOnFailure: true,
+	}
+
+	rules := validatorrules.NewDefaultRules()
+	NewMaxAliasesRule(cfg, rules)
+
+	parsedQuery, _ := parser.ParseQuery(&ast.Source{Name: "ff", Input: query})
+	schema := gqlparser.MustLoadSchema(&ast.Source{
+		Name:    "graph/schema.graphqls",
+		Input:   schemaStr,
+		BuiltIn: false,
+	})
+
+	errs := validator.ValidateWithRules(schema, parsedQuery, rules)
+
+	assert.Empty(t, errs, "each operation independently has 2 aliases, below the limit of 3; both should be allowed")
+}
+
+// Test_countSelectionSet_CyclicFragments verifies the traversal terminates
+// when named fragments reference each other, instead of recursing forever.
+func Test_countSelectionSet_CyclicFragments(t *testing.T) {
+	fragmentA := &ast.FragmentDefinition{
+		Name: "FragmentA",
+	}
+	fragmentB := &ast.FragmentDefinition{
+		Name: "FragmentB",
+	}
+
+	fragmentA.SelectionSet = ast.SelectionSet{
+		&ast.FragmentSpread{Name: "FragmentB", Definition: fragmentB},
+		&ast.Field{Name: "title", Alias: "a1"},
+	}
+	fragmentB.SelectionSet = ast.SelectionSet{
+		&ast.FragmentSpread{Name: "FragmentA", Definition: fragmentA},
+		&ast.Field{Name: "title", Alias: "a2"},
+	}
+
+	counter := &aliasCounter{
+		fragmentAliases: make(map[string]int),
+		activeFragments: make(map[string]bool),
+	}
+
+	selectionSet := ast.SelectionSet{
+		&ast.FragmentSpread{Name: "FragmentA", Definition: fragmentA},
+	}
+
+	done := make(chan struct{})
+	var count int
+	go func() {
+		defer close(done)
+		count = counter.countSelectionSet(selectionSet)
+	}()
+
+	select {
+	case <-done:
+		assert.Equal(t, 2, count, "both aliases are counted once despite the cyclic reference")
+	case <-time.After(2 * time.Second):
+		t.Fatal("countSelectionSet did not terminate on cyclic fragment references")
+	}
 }

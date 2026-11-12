@@ -54,7 +54,7 @@ func init() {
 func NewMaxDepthRule(cfg Config, rules *validatorrules.Rules) {
 	rules.AddRule("MaxDepth", func(observers *validator.Events, addError core.AddErrFunc) {
 		observers.OnOperation(func(_ *validator.Walker, operation *ast.OperationDefinition) {
-			fieldDepth, listDepth := countDepth(operation.SelectionSet)
+			fieldDepth, listDepth := newDepthCounter().countDepth(operation.SelectionSet)
 
 			operationName := ""
 			if cfg.MetricsIncludeOperationName {
@@ -112,7 +112,17 @@ func NewMaxDepthRule(cfg Config, rules *validatorrules.Rules) {
 	})
 }
 
-func countDepth(selectionSet ast.SelectionSet) (int, int) { // nolint:cyclop // inherently cyclomatic
+type depthCounter struct {
+	// activeFragments tracks named fragments currently on the traversal stack
+	// to guard against cyclic or repeated fragment references.
+	activeFragments map[string]bool
+}
+
+func newDepthCounter() *depthCounter {
+	return &depthCounter{activeFragments: make(map[string]bool)}
+}
+
+func (c *depthCounter) countDepth(selectionSet ast.SelectionSet) (int, int) { // nolint:cyclop // inherently cyclomatic
 	if selectionSet == nil {
 		return 0, 0
 	}
@@ -125,7 +135,7 @@ func countDepth(selectionSet ast.SelectionSet) (int, int) { // nolint:cyclop // 
 	for _, selection := range selectionSet {
 		switch v := selection.(type) {
 		case *ast.Field:
-			fieldSelectionDepth, listSelectionDepth := countDepth(v.SelectionSet)
+			fieldSelectionDepth, listSelectionDepth := c.countDepth(v.SelectionSet)
 			fieldSelectionDepth++ // increase because we're on a field
 
 			if v.Definition != nil && isList(v.Definition.Type) {
@@ -137,8 +147,27 @@ func countDepth(selectionSet ast.SelectionSet) (int, int) { // nolint:cyclop // 
 			if fieldSelectionDepth > fieldDepth {
 				fieldDepth = fieldSelectionDepth
 			}
+		case *ast.InlineFragment:
+			fieldSelectionDepth, listSelectionDepth := c.countDepth(v.SelectionSet)
+			if fieldSelectionDepth > fieldDepth {
+				fieldDepth = fieldSelectionDepth
+			}
+			if listSelectionDepth > listDepth {
+				listDepth = listSelectionDepth
+			}
 		case *ast.FragmentSpread:
-			fieldSelectionDepth, listSelectionDepth := countDepth(v.Definition.SelectionSet)
+			if v.Definition == nil || c.activeFragments[v.Definition.Name] {
+				// Unknown fragment, or a fragment that is already being
+				// expanded (cyclic/repeated reference). Stop here so the
+				// traversal cannot loop; GraphQL validation rejects cyclic
+				// fragment documents anyway.
+				continue
+			}
+
+			c.activeFragments[v.Definition.Name] = true
+			fieldSelectionDepth, listSelectionDepth := c.countDepth(v.Definition.SelectionSet)
+			delete(c.activeFragments, v.Definition.Name)
+
 			if fieldSelectionDepth > fieldDepth {
 				fieldDepth = fieldSelectionDepth
 			}

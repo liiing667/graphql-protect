@@ -11,6 +11,7 @@ import (
 	"github.com/vektah/gqlparser/v2/validator"
 	validatorrules "github.com/vektah/gqlparser/v2/validator/rules"
 	"testing"
+	"time"
 )
 
 func Test_MaxListDepthRule(t *testing.T) {
@@ -150,6 +151,37 @@ type User {
 			},
 			want: nil,
 		},
+		{
+			name: "counts list depth hidden inside inline fragments",
+			args: args{
+				cfg: Config{
+					Field: MaxRule{
+						Enabled: false,
+					},
+					List: MaxRule{
+						Enabled:         true,
+						Max:             2,
+						RejectOnFailure: true,
+					},
+				},
+				query: `
+				query A {
+					me {
+						... on User {
+							friends {
+								friends {
+									friends {
+									name
+									}
+								}
+							}
+						}
+				 	}
+				}`,
+				schema: schema,
+			},
+			want: fmt.Errorf("list depth limit of %d exceeded, found %d", 2, 3),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -174,6 +206,43 @@ type User {
 
 			validator.RemoveRule("MaxDepth")
 		})
+	}
+}
+
+// Test_countDepth_CyclicFragments verifies depth traversal terminates when
+// named fragments reference each other, instead of recursing forever.
+func Test_countDepth_CyclicFragments(t *testing.T) {
+	fragmentA := &ast.FragmentDefinition{Name: "FragmentA"}
+	fragmentB := &ast.FragmentDefinition{Name: "FragmentB"}
+
+	fragmentA.SelectionSet = ast.SelectionSet{
+		&ast.FragmentSpread{Name: "FragmentB", Definition: fragmentB},
+		&ast.Field{Name: "title"},
+	}
+	fragmentB.SelectionSet = ast.SelectionSet{
+		&ast.FragmentSpread{Name: "FragmentA", Definition: fragmentA},
+		&ast.Field{Name: "title"},
+	}
+
+	counter := newDepthCounter()
+
+	selectionSet := ast.SelectionSet{
+		&ast.FragmentSpread{Name: "FragmentA", Definition: fragmentA},
+	}
+
+	done := make(chan struct{})
+	var fieldDepth, listDepth int
+	go func() {
+		defer close(done)
+		fieldDepth, listDepth = counter.countDepth(selectionSet)
+	}()
+
+	select {
+	case <-done:
+		assert.Equal(t, 1, fieldDepth, "depth is computed without following the cyclic reference")
+		assert.Equal(t, 0, listDepth)
+	case <-time.After(2 * time.Second):
+		t.Fatal("countDepth did not terminate on cyclic fragment references")
 	}
 }
 
@@ -297,6 +366,67 @@ type Price {
 				fragment BookFragment on Book {
 				 	author {
 						name
+					}
+				}`,
+				schema: schema,
+			},
+			want: validation.RuleValidationResult{
+				Rule:          "max-depth",
+				OperationName: "",
+				Result:        validation.REJECTED,
+				Message:       fmt.Sprintf("field depth limit of %d exceeded, found %d", 2, 3),
+			}.AsGqlError(),
+		},
+		{
+			name: "counts depth hidden inside inline fragments",
+			args: args{
+				cfg: Config{
+					Field: MaxRule{
+						Max:             2,
+						Enabled:         true,
+						RejectOnFailure: true,
+					},
+				},
+				query: `
+				query A {
+					getBook(title: "null") {
+						... on Book {
+							author {
+								name
+							}
+						}
+				 	}
+				}`,
+				schema: schema,
+			},
+			want: validation.RuleValidationResult{
+				Rule:          "max-depth",
+				OperationName: "",
+				Result:        validation.REJECTED,
+				Message:       fmt.Sprintf("field depth limit of %d exceeded, found %d", 2, 3),
+			}.AsGqlError(),
+		},
+		{
+			name: "counts depth of inline fragments nested inside named fragments",
+			args: args{
+				cfg: Config{
+					Field: MaxRule{
+						Max:             2,
+						Enabled:         true,
+						RejectOnFailure: true,
+					},
+				},
+				query: `
+				query A {
+					getBook(title: "null") {
+				   		...BookFragment
+				 	}
+				}
+				fragment BookFragment on Book {
+					... on Book {
+						author {
+							name
+						}
 					}
 				}`,
 				schema: schema,
